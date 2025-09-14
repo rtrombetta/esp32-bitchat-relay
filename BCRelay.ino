@@ -43,7 +43,7 @@
 #define ANNOUNCE_INTERVAL_MS          30000UL
 #define REQUESTED_MTU                 517
 #define DEFAULT_MTU                   23
-#define FALLBACK_CAP                  182     // safe for iOS if MTU not negotiated (ATT 23 -> 20 payload; we keep headroom)
+#define FALLBACK_CAP                  20     // safe for iOS if MTU not negotiated (ATT 23 -> 20 payload; we keep headroom)
 #define MIN_CHUNK_SIZE                64
 #define FRAG_LIFETIME_MS              30000UL
 #define MAX_INFLIGHT_FRAGS            10
@@ -158,13 +158,17 @@ static bool dedupSeen(uint64_t h){
 
 // Compute current maximum payload cap across centrals (min MTU among connected peers)
 static size_t capServer(){
-  if (gPeerMtus.empty()) return FALLBACK_CAP;
-  uint16_t minMtu=REQUESTED_MTU; bool ok=false;
-  for(auto &kv: gPeerMtus){
-    if(kv.second!=DEFAULT_MTU){ ok=true; if(kv.second<minMtu) minMtu=kv.second; }
+  if (gPeerMtus.empty()) return FALLBACK_CAP; // 20 bytes (ATT 23)
+  uint16_t minMtu = 0xFFFF;
+  for (auto &kv : gPeerMtus) {
+    if (kv.second < minMtu) minMtu = kv.second;
   }
-  return ok ? (minMtu-3) : FALLBACK_CAP; // minus 3B ATT header
+  if (minMtu < DEFAULT_MTU) minMtu = DEFAULT_MTU; // sanidade (mínimo 23)
+  size_t cap = (minMtu > 3) ? (minMtu - 3) : FALLBACK_CAP;
+  if (cap < FALLBACK_CAP) cap = FALLBACK_CAP;     // nunca abaixo de 20
+  return cap;
 }
+
 
 // Enqueue packet to TX queue (non-blocking)
 static void txEnqueue(const uint8_t* p, size_t n){
@@ -189,15 +193,23 @@ static void txWorker(void*){
     xSemaphoreGive(gTxMutex);
 
     if(has && gChar){
-      // Set value and send a notify
       gChar->setValue(it.pkt.data(), it.pkt.size());
-      gChar->notify();
-      gNotifies++;
-      gChar->indicate();
-      gIndicates++;
-      gPktsOut++; 
-      gBytesOut+=it.pkt.size();
-      kickTxBlink();
+
+      bool sent = false;
+      if (gCCCD && gCCCD->getNotifications()) {
+        gChar->notify(); gNotifies++; sent = true;
+      }
+      if (gCCCD && gCCCD->getIndications()) {
+        gChar->indicate(); gIndicates++; sent = true;
+      }
+      // Fallback: se por algum motivo não existe CCCD, tenta notify
+      if (!gCCCD && !sent) { gChar->notify(); gNotifies++; sent = true; }
+
+      if (sent) {
+        gPktsOut++;
+        gBytesOut += it.pkt.size();
+        kickTxBlink();
+      }
     } else {
       vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -341,11 +353,14 @@ class CharCallbacks: public BLECharacteristicCallbacks {
       FragmentKey key{sender, fragID};
       if(incomingFragments.find(key)==incomingFragments.end()){
         if(incomingFragments.size()>=MAX_INFLIGHT_FRAGS || (gInflightBytes+chunkLen)>MAX_INFLIGHT_BYTES){
-          // Drop oldest assembly to free memory
+          // Drop realmente o mais antigo (menor timestamp)
           auto oldest = fragmentMetadata.begin();
+          for (auto it2 = fragmentMetadata.begin(); it2 != fragmentMetadata.end(); ++it2) {
+            if (it2->second.second < oldest->second.second) oldest = it2;
+          }
           auto mapIt = incomingFragments.find(oldest->first);
-          if(mapIt!=incomingFragments.end()){
-            for(auto &kv: mapIt->second) gInflightBytes -= kv.second.size();
+          if (mapIt != incomingFragments.end()) {
+            for (auto &kv : mapIt->second) gInflightBytes -= kv.second.size();
             incomingFragments.erase(mapIt);
           }
           fragmentMetadata.erase(oldest);
@@ -358,24 +373,35 @@ class CharCallbacks: public BLECharacteristicCallbacks {
         gInflightBytes += chunkLen;
       }
       // Completed?
-      if(incomingFragments[key].size()==total){
-        std::vector<uint8_t> out(19+600);
-        out[0]=0x01; out[1]=origType; out[2]=buf[2];
-        memcpy(out.data()+3,  buf+3,  8);
-        memcpy(out.data()+11, buf+11, 8);
-        size_t pay=0; bool overflow=false;
-        for(uint16_t i=0;i<total;i++){
-          auto &ch = incomingFragments[key][i];
-          if(pay + ch.size() > 600){ overflow=true; break; }
-          memcpy(out.data()+19+pay, ch.data(), ch.size());
-          pay += ch.size();
+        if (incomingFragments[key].size() == total) {
+          // calcula o payload total
+          size_t totalPay = 0;
+          for (uint16_t i = 0; i < total; i++) totalPay += incomingFragments[key][i].size();
+
+          // guarda-chuva: limita reassembly gigante
+          if (totalPay > 4096) {
+            for (auto &kv : incomingFragments[key]) gInflightBytes -= kv.second.size();
+            incomingFragments.erase(key); fragmentMetadata.erase(key);
+            return;
+          }
+
+          std::vector<uint8_t> out(19 + totalPay);
+          out[0] = 0x01; out[1] = origType; out[2] = buf[2];
+          memcpy(out.data()+3,  buf+3,  8);
+          memcpy(out.data()+11, buf+11, 8);
+
+          size_t pay = 0;
+          for (uint16_t i = 0; i < total; i++) {
+            auto &ch = incomingFragments[key][i];
+            memcpy(out.data()+19+pay, ch.data(), ch.size());
+            pay += ch.size();
+          }
+
+          for (auto &kv : incomingFragments[key]) gInflightBytes -= kv.second.size();
+          incomingFragments.erase(key); fragmentMetadata.erase(key);
+
+          relayToCentrals(out.data(), out.size()); // re-fragmenta conforme CAP atual
         }
-        for(auto &kv: incomingFragments[key]) gInflightBytes -= kv.second.size();
-        incomingFragments.erase(key); fragmentMetadata.erase(key);
-        if(overflow) return;
-        size_t outLen = 19+pay;
-        relayToCentrals(out.data(), outLen);
-      }
     } else {
       // Direct relay or re-fragment to match CAP
       if(len<=cap) txEnqueue(buf, len);
@@ -477,7 +503,7 @@ void loop(){
     bool anyNotif = gCCCD ? gCCCD->getNotifications() : false;
     bool anyIndic = gCCCD ? gCCCD->getIndications()  : false;
 
-    Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u indicates=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{lastWrite:notify=%u,indicate=%u} %s\r\n",
+    Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u indicates=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{notify=%u,indicate=%u} %s\r\n",
       gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies, gIndicates,
       ESP.getFreeHeap(), (unsigned)cap, (unsigned)qsz, (unsigned)gNotifyTokens,
       (unsigned)gSeenDeque.size(), (unsigned)gDropsDedup, (unsigned)gDropsBackpressure,
