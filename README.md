@@ -223,4 +223,14 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 
 ---
 
+## Tested environment
+
+- Windows + VS Code + Arduino extension  
+- ESP32 core: **esp32:esp32 @ 2.0.15**  
+- Board (FQBN): **esp32:esp32:esp32** (Generic ESP32)  
+- Build options: `LoopCore=1`, `EventsCore=1`, `CPUFreq=240`, `FlashMode=qio`, `FlashFreq=80MHz`, `UploadSpeed=921600`, `PSRAM=disabled`, `PartitionScheme=min_spiffs`  
+- Serial: 115200 baud
+
+---
+
 Happy relaying. Contributions welcome.
