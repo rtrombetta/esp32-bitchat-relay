@@ -284,11 +284,25 @@ static void relayToCentrals(const uint8_t* pkt, size_t len){
         (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
     }
   } else {
-    sendFragmentedNotify(pkt, len, cap);
-    if(debugLevel >= 3){
-      char sid[17]; hex8(&pkt[11], sid);
-      Serial.printf("[REL] fragmented len=%u cap=%u peers=%u sid=%s\r\n",
-        (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
+    //sendFragmentedNotify(pkt, len, cap);
+    //if(debugLevel >= 3){
+    //  char sid[17]; hex8(&pkt[11], sid);
+    //  Serial.printf("[REL] fragmented len=%u cap=%u peers=%u sid=%s\r\n",
+    //    (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
+    //}
+    if (cap >= 32) {
+      sendFragmentedNotify(pkt, len, cap);
+      if (debugLevel >= 3) {
+        char sid[17]; hex8(&pkt[11], sid);
+        Serial.printf("[REL] fragmented len=%u cap=%u peers=%u sid=%s\r\n",
+          (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
+      }
+    } else {
+      if (debugLevel >= 2) {
+        char sid[17]; hex8(&pkt[11], sid);
+        Serial.printf("[REL] drop (cap<32) len=%u cap=%u peers=%u sid=%s\r\n",
+          (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
+      }
     }
   }
 }
@@ -330,9 +344,22 @@ class CharCallbacks: public BLECharacteristicCallbacks {
     kickRxBlink();
 
     // Dedup on header + first 32 payload bytes (stable enough, avoids loops/echo)
-    size_t hdr = std::min(len,(size_t)19), extra=(len>hdr)? std::min(len-hdr,(size_t)32):0;
-    uint64_t h = fnv1a64(p, hdr); if(extra) h ^= fnv1a64(p+hdr, extra);
-    if(dedupSeen(h)){ gDropsDedup++; return; }
+    //size_t hdr = std::min(len,(size_t)19), extra=(len>hdr)? std::min(len-hdr,(size_t)32):0;
+    //uint64_t h = fnv1a64(p, hdr); if(extra) h ^= fnv1a64(p+hdr, extra);
+    //if(dedupSeen(h)){ gDropsDedup++; return; }
+
+    // Dedup: ignora o TTL (byte 2) no hash para não quebrar em loops com ttl--.
+    size_t hdr = std::min(len, (size_t)19);
+    uint8_t hdrNoTTL[19];
+    memcpy(hdrNoTTL, p, hdr);
+    if (hdr >= 3) hdrNoTTL[2] = 0; // zera o TTL
+    size_t extra = (len > hdr) ? std::min(len - hdr, (size_t)32) : 0;
+
+    uint64_t h = fnv1a64(hdrNoTTL, hdr);
+    if (extra) h ^= fnv1a64(p + hdr, extra);
+
+    if (dedupSeen(h)) { gDropsDedup++; return; }
+
 
     static uint8_t buf[600]; if(len>sizeof(buf)) return;
     memcpy(buf, p, len);
@@ -404,8 +431,9 @@ class CharCallbacks: public BLECharacteristicCallbacks {
         }
     } else {
       // Direct relay or re-fragment to match CAP
-      if(len<=cap) txEnqueue(buf, len);
-      else         sendFragmentedNotify(buf, len, cap);
+      //if(len<=cap) txEnqueue(buf, len);
+      //else         sendFragmentedNotify(buf, len, cap);
+      relayToCentrals(buf, len);
     }
   }
 };
