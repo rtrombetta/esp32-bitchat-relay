@@ -1,6 +1,6 @@
 /*
  * BitChat Relay – HUB (GATT Server only)
- * Goal: extremely simple, like "Bitle": receive on WRITE/WRITE_NR, relay to all centrals via NOTIFY/INDICATE.
+ * Goal: extremely simple, like "Bitle": receive on WRITE/WRITE_NR, relay to all centrals via NOTIFY.
  *
  * Features:
  *  - Peripheral-only (no scanning, no client connects) -> never blocks on connection attempts
@@ -10,11 +10,6 @@
  *  - Periodic ANNOUNCE with jitter
  *  - Dynamic CAP based on minimum negotiated MTU; safe fallback for iOS (no MTU change)
  *  - Logs in English
- *
- * Notes:
- *  - Some mobile apps subscribe only to INDICATE instead of NOTIFY.
- *    We enable both properties. On transmit we call notify() and, if there are indication subscribers, also indicate().
- *  - This avoids “relay working but phone doesn't see anything” because CCCD wasn’t set to notifications.
  */
 
 #include <Arduino.h>
@@ -23,6 +18,7 @@
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
+//#include <NimBLEDevice.h>
 #include <map>
 #include <vector>
 #include <queue>
@@ -73,7 +69,7 @@ static uint8_t gSenderID[8];
 
 // ===== Stats =====
 static uint32_t gPktsIn=0, gPktsOut=0, gBytesIn=0, gBytesOut=0;
-static uint32_t gWrites=0, gNotifies=0, gIndicates=0, gLastStats=0;
+static uint32_t gWrites=0, gNotifies=0, gLastStats=0;
 static uint32_t gDropsDedup=0, gDropsBackpressure=0;
 static uint32_t gType1In=0, gType2In=0;
 
@@ -179,7 +175,7 @@ static void txEnqueue(const uint8_t* p, size_t n){
   xSemaphoreGive(gTxMutex);
 }
 
-// Background TX worker: rate-limited notify + optional indicate (if subscribed)
+// Background TX worker: rate-limited notify
 static void txWorker(void*){
   for(;;){
     uint32_t ms = millis();
@@ -194,22 +190,11 @@ static void txWorker(void*){
 
     if(has && gChar){
       gChar->setValue(it.pkt.data(), it.pkt.size());
-
-      bool sent = false;
-      if (gCCCD && gCCCD->getNotifications()) {
-        gChar->notify(); gNotifies++; sent = true;
-      }
-      if (gCCCD && gCCCD->getIndications()) {
-        gChar->indicate(); gIndicates++; sent = true;
-      }
-      // Fallback: se por algum motivo não existe CCCD, tenta notify
-      if (!gCCCD && !sent) { gChar->notify(); gNotifies++; sent = true; }
-
-      if (sent) {
-        gPktsOut++;
-        gBytesOut += it.pkt.size();
-        kickTxBlink();
-      }
+      gChar->notify(); 
+      gNotifies++;       
+      gPktsOut++;
+      gBytesOut += it.pkt.size();
+      kickTxBlink();
     } else {
       vTaskDelay(pdMS_TO_TICKS(2));
     }
@@ -463,14 +448,12 @@ static void setup_ble_server(){
 
   BLEService* svc = gServer->createService(BITCHAT_SERVICE_UUID_MAINNET);
 
-  // Add INDICATE besides NOTIFY — some clients subscribe only to INDICATE
-  gChar = svc->createCharacteristic(
+    gChar = svc->createCharacteristic(
     BITCHAT_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ    |
     BLECharacteristic::PROPERTY_WRITE   |
     BLECharacteristic::PROPERTY_WRITE_NR|
-    BLECharacteristic::PROPERTY_NOTIFY  |
-    BLECharacteristic::PROPERTY_INDICATE
+    BLECharacteristic::PROPERTY_NOTIFY
   );
 
   gChar->addDescriptor(new BLE2902());
@@ -539,14 +522,13 @@ void loop(){
 
     uint32_t centrals = gPeerMtus.size();
     bool anyNotif = gCCCD ? gCCCD->getNotifications() : false;
-    bool anyIndic = gCCCD ? gCCCD->getIndications()  : false;
     Serial.println("=== BitChat Relay Status ===");
-    Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u indicates=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{notify=%u,indicate=%u} %s\r\n",
-      gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies, gIndicates,
+    Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{notify=%u} %s\r\n",
+      gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies,
       ESP.getFreeHeap(), (unsigned)cap, (unsigned)qsz, (unsigned)gNotifyTokens,
       (unsigned)gSeenDeque.size(), (unsigned)gDropsDedup, (unsigned)gDropsBackpressure,
       (unsigned)gInflightBytes, gType1In, gType2In,
-      centrals, (unsigned)anyNotif, (unsigned)anyIndic, mtuList.c_str());
+      centrals, (unsigned)anyNotif, mtuList.c_str());
     Serial.println("=== End Status ===");
   }
 
