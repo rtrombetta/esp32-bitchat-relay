@@ -273,7 +273,6 @@ static void sendFragmentedNotify(const uint8_t* orig, size_t origLen, size_t cap
 }
 
 // Relay helper: either direct or re-fragment + verbose log at DBG3
-// Relay helper: either direct or re-fragment + verbose log at DBG3
 static void relayToCentrals(const uint8_t* pkt, size_t len){
   size_t cap = capServer();
   if(len <= cap){
@@ -332,6 +331,17 @@ class CharCallbacks: public BLECharacteristicCallbacks {
     const uint8_t* p = (const uint8_t*)v.data();
     size_t len = v.size();
     if(len<MIN_PKT_LEN || p[0]!=0x01) return;
+
+    if (debugLevel >= 4) {
+      // imprime 8B do payload logo após header base (offset 19)
+      char sid[17]; hex8(&p[11], sid);
+      uint8_t sniff[8] = {0};
+      size_t sniffLen = (len > 27) ? 8 : (len > 19 ? len - 19 : 0);
+      if (sniffLen) memcpy(sniff, p + 19, sniffLen);
+      Serial.printf("[SNIFF] sid=%s type=%u len=%u ttl=%u p0=%02X p1=%02X p2=%02X p3=%02X p4=%02X p5=%02X p6=%02X p7=%02X\r\n",
+        sid, p[1], (unsigned)len, p[2],
+        sniff[0],sniff[1],sniff[2],sniff[3],sniff[4],sniff[5],sniff[6],sniff[7]);
+    }
 
     gWrites++; gPktsIn++; gBytesIn+=len;
     if(p[1]==1) gType1In++; else if(p[1]==2) gType2In++;
@@ -530,13 +540,14 @@ void loop(){
     uint32_t centrals = gPeerMtus.size();
     bool anyNotif = gCCCD ? gCCCD->getNotifications() : false;
     bool anyIndic = gCCCD ? gCCCD->getIndications()  : false;
-
+    Serial.println("=== BitChat Relay Status ===");
     Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u indicates=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{notify=%u,indicate=%u} %s\r\n",
       gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies, gIndicates,
       ESP.getFreeHeap(), (unsigned)cap, (unsigned)qsz, (unsigned)gNotifyTokens,
       (unsigned)gSeenDeque.size(), (unsigned)gDropsDedup, (unsigned)gDropsBackpressure,
       (unsigned)gInflightBytes, gType1In, gType2In,
       centrals, (unsigned)anyNotif, (unsigned)anyIndic, mtuList.c_str());
+    Serial.println("=== End Status ===");
   }
 
   delay(5);
