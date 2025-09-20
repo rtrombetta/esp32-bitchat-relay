@@ -31,6 +31,9 @@
 #define BITCHAT_SERVICE_UUID_MAINNET  "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C"
 #define BITCHAT_CHARACTERISTIC_UUID   "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D"
 
+// ===== Limites de conexões =====
+#define MAX_PEERS                     8
+
 // ===== Tipos =====
 #define ANNOUNCE_TYPE                 0x01
 #define FRAGMENT_TYPE                 0x06
@@ -422,6 +425,12 @@ static void relayToCentrals(const uint8_t* pkt, size_t len, int origin){
 class SvrCallbacks: public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo& info) override {
     gPeerMtus[info.getConnHandle()] = DEFAULT_MTU;
+    // se já atingiu o teto, desconecta imediatamente
+    if (gPeerMtus.size() > MAX_PEERS) {
+      if (gServer)gServer->disconnect(info.getConnHandle());
+      DBG(2, String("Max peers reached, disconnecting new central (ch=") + String(info.getConnHandle()) + ")");
+      return;
+    }
     DBG(3, String("Central connected (ch=") + String(info.getConnHandle()) + ")");
     NimBLEDevice::startAdvertising();
   }
@@ -704,5 +713,23 @@ void loop(){
     Serial.println("=== End Status ===");
   }
 
-  delay(5);
+  // Comandos seriais
+  if (Serial.available()) {
+    char k = Serial.read();
+    switch (k) {
+      case 'r':
+        ESP.restart();
+        break;
+      case '+':
+        if (debugLevel < 5) debugLevel++;
+        Serial.printf("Debug level now %d\r\n", debugLevel);
+        break;
+      case '-':
+        if (debugLevel > 0) debugLevel--;
+        Serial.printf("Debug level now %d\r\n", debugLevel);
+        break;        
+    }
+  }
+
+  vTaskDelay(10);
 }

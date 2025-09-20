@@ -6,6 +6,11 @@ It never acts as a BLE client or scanner. Focus: *low latency, predictable memor
 > Codebase: single-file Arduino sketch using **NimBLE-Arduino ≥ 2.3.6**.
 > Purpose: Extend coverage between other bitchat devices that are out of range of each other but are in range of the ESP (extends coverage area).
 
+<p align="center">
+  <img src="assets/coverage.png" alt="BitChat Relay coverage" width="720">
+</p>
+
+
 ---
 
 ## ✨ Features (what it actually does)
