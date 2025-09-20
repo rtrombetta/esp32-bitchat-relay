@@ -326,4 +326,4 @@ inflightB=… t1_in=… t2_in=… peers=… subs{notify=…} MTUs: ch=H:mtu=M �
 
 ## 📄 License
 
-MIT License © 2024 Ricardo and contributors
+MIT License © 2025 Ricardo
