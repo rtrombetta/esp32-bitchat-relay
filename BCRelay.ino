@@ -26,47 +26,64 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
+#include "espn.h"
 
-// ===== BitChat UUIDs (placeholders observados) =====
+// Version
+#define VERSION "1.0.1"
+
+// ===== BitChat UUIDs (placeholders) =====
 #define BITCHAT_SERVICE_UUID_MAINNET  "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C"
 #define BITCHAT_CHARACTERISTIC_UUID   "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D"
 
-// ===== Limites de conexões =====
-#define MAX_PEERS                     8
+// ===== Connection Limits =====
+#define MAX_PEERS                     8   // max connections
+#define BLE_POWER                     9   // dBm (0..9 typical)
 
-// ===== Tipos =====
-#define ANNOUNCE_TYPE                 0x01
-#define FRAGMENT_TYPE                 0x06
-#define MIN_PKT_LEN                   21
+// ===== Types =====
+#define ANNOUNCE_TYPE                 0x01  // BitChat announce
+#define FRAGMENT_TYPE                 0x06  // BitChat fragment
+#define MIN_PKT_LEN                   21    // 1+8+8+2+1+1 (type+sender+fragID+seq/ttl+ttl+data)
 
-// ===== Timers / tamanhos =====
-#define ANNOUNCE_INTERVAL_MS          30000UL
-#define REQUESTED_MTU                 517
-#define DEFAULT_MTU                   23
-#define FALLBACK_CAP                  20     // ATT 23 -> 20 payload
-#define MIN_CHUNK_SIZE                64
-#define FRAG_LIFETIME_MS              30000UL
-#define MAX_INFLIGHT_FRAGS            10
-#define MAX_INFLIGHT_BYTES            65536UL
+// ===== Timers / Sizes =====
+#define ANNOUNCE_INTERVAL_MS          30000UL // 30s
+#define REQUESTED_MTU                 517     // max MTU
+#define DEFAULT_MTU                   23      // ATT default MTU
+#define FALLBACK_CAP                  20      // ATT 23 -> 20 payload
+#define MIN_CHUNK_SIZE                64      // min fragment size (avoid excessive fragmentation)
+#define FRAG_LIFETIME_MS              30000UL // time to wait for all fragments
+#define MAX_INFLIGHT_FRAGS            10      // max assemblies in progress
+#define MAX_INFLIGHT_BYTES            65536UL // ~64 KB total inflight
 
-// ---- Novos limites ----
-// Limite global já existe (MAX_INFLIGHT_*). Agora cota por remetente:
-#define MAX_INFLIGHT_BYTES_PER_SENDER 16384UL   // ~16 KB por sender
-#define MAX_FRAGS_PER_SENDER          4         // no máx 4 assemblies por sender
-// Limite de fila de TX (substitui literal "128"):
-#define MAX_TX_QUEUE                  128
+// ===== Backhaul (ESPNOW) =====
+#define ESP_BH                        true    // enable ESPNOW backhaul
+#define ESP_BH_CHANNEL                13      // Wi-Fi channel (1/6/11 typical)
+#define ESP_BH_LINK_MTU               230     // ESPNOW MTU (<=250 safe)
+#define ESP_BH_TX_CORE                1       // core for TX (0/1 or -1 no affinity)
+#define ESP_BH_RX_CORE                0       // core for RX (0/1 or -1 no affinity)
+#define ESP_BH_BALANCED_SPLIT         true    // balanced fragment sizes
 
-// ===== LED (opcional) =====
-#ifndef LED_PIN
-#define LED_PIN 2
+// ---- Sender Limits ----
+#define MAX_INFLIGHT_BYTES_PER_SENDER 16384UL   // ~16 KB each sender
+#define MAX_FRAGS_PER_SENDER          4         // max assemblies per sender
+#define MAX_TX_QUEUE                  128       // max TX queue size (global, shared by all senders)
+
+// ===== LED  =====
+#ifndef LED_PIN             // built-in LED 
+#define LED_PIN 2           // GPIO2 (D2) on most ESP32 boards
 #endif
-#define LED_RX_ON_MS 30
-#define LED_TX_ON_MS 30
-#define LED_TX_GAP_MS 60
+#define LED_RX_ON_MS 30     // time to keep LED on on RX
+#define LED_TX_ON_MS 30     // time to keep LED on on TX
+#define LED_TX_GAP_MS 60    // time to keep LED off between blinks
 
 // ===== Debug level =====
 static uint8_t debugLevel = 3;
-#define DBG(lvl, msg) do{ if(debugLevel>=lvl){ Serial.print("[DBG");Serial.print(lvl);Serial.print("] ");Serial.println(msg);} }while(0)
+
+// ===== Serial =====
+static SemaphoreHandle_t gSerialMutex;
+
+// ==== ESPNOW backhaul =====
+static espn gEspNow;
+static const uint8_t NET_ID[espn::NET_ID_LEN] = { 'B','C','M','E','S','H','0','1' }; // "BCMESH01"
 
 // ===== Estado BLE =====
 static NimBLEServer*         gServer = nullptr;
@@ -85,18 +102,26 @@ static uint32_t gDropsDedup=0, gDropsBackpressure=0;
 static uint32_t gType1In=0, gType2In=0;
 
 // ===== LED state =====
-static bool ledState=false;
+static bool     ledState=false;
 static uint32_t rxBlinkUntil=0;
-static uint8_t txBlinkPhase=0;
+static uint8_t  txBlinkPhase=0;
 static uint32_t txPhaseUntil=0;
 
 // ===== Dedup (FNV-1a 64-bit) =====
 static inline uint64_t fnv1a64(const uint8_t* d, size_t n){
   uint64_t h=1469598103934665603ULL;
-  for(size_t i=0;i<n;i++){ h^=d[i]; h*=1099511628211ULL; }
+  for(size_t i=0;i<n;i++){ 
+    h^=d[i]; 
+    h*=1099511628211ULL; 
+  }
   return h;
 }
-struct DedupEntry { uint64_t h; uint64_t tms; };
+
+struct DedupEntry { 
+  uint64_t h; 
+  uint64_t tms; 
+};
+
 static std::deque<DedupEntry> gSeenDeque;
 static std::unordered_set<uint64_t> gSeenSet;
 static const size_t   DEDUP_MAX=1024;
@@ -128,23 +153,79 @@ static uint32_t gNotifyTokens = 0;
 static uint32_t gLastTokenRefill = 0;
 
 // ===== Utils =====
-static inline uint64_t nowUs(){ return (uint64_t)esp_timer_get_time(); }
-static inline uint64_t nowMs(){ return nowUs()/1000ULL; }
-static inline void writeU64BE(uint8_t* dst, uint64_t v){ for(int i=7;i>=0;--i) dst[7-i]=(v>>(i*8))&0xFF; }
+// Time in microseconds
+static inline uint64_t nowUs(){ 
+  return (uint64_t)esp_timer_get_time(); 
+}
+
+void safePrintf(const char* fmt, ...){
+  va_list args; 
+  va_start(args, fmt);
+  if (gSerialMutex)  {
+    xSemaphoreTake(gSerialMutex, portMAX_DELAY);
+    vprintf(fmt, args);
+    xSemaphoreGive(gSerialMutex);
+  } else vprintf(fmt, args);
+  va_end(args);
+}
+
+// Time in milliseconds
+static inline uint64_t nowMs(){ 
+  return nowUs()/1000ULL; 
+}
+
+// Write big-endian u64
+static inline void writeU64BE(uint8_t* dst, uint64_t v){ 
+  for(int i=7;i>=0;--i) dst[7-i]=(v>>(i*8))&0xFF; 
+}
+
+// Write big-endian u32
 static void hex8(const uint8_t* p, char* out17){
   static const char* H="0123456789abcdef";
-  for(int i=0;i<8;i++){ out17[i*2]=H[(p[i]>>4)&0xF]; out17[i*2+1]=H[p[i]&0xF]; } out17[16]='\0';
+  for(int i=0;i<8;i++){ 
+    out17[i*2]=H[(p[i]>>4)&0xF]; 
+    out17[i*2+1]=H[p[i]&0xF]; 
+  } 
+  out17[16]='\0';
 }
+
+// Generate sender ID from MAC + efuse
 static void makeSenderID(){
   uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_BT);
   for(int i=0;i<6;i++) gSenderID[i]=mac[i];
   uint16_t s=(uint16_t)(ESP.getEfuseMac()&0xFFFF);
-  gSenderID[6]=(uint8_t)(s>>8); gSenderID[7]=(uint8_t)s;
+  gSenderID[6]=(uint8_t)(s>>8); 
+  gSenderID[7]=(uint8_t)s;
 }
-static inline void ledOn(){ if(!ledState){ ledState=true; digitalWrite(LED_PIN, HIGH);} }
-static inline void ledOff(){ if(ledState){ ledState=false; digitalWrite(LED_PIN, LOW);} }
-static void kickRxBlink(){ ledOn(); rxBlinkUntil = millis()+LED_RX_ON_MS; }
-static void kickTxBlink(){ txBlinkPhase=1; ledOn(); txPhaseUntil = millis()+LED_TX_ON_MS; }
+
+// Turn LED on
+static inline void ledOn(){ 
+  if(!ledState){ 
+    ledState=true; 
+    digitalWrite(LED_PIN, HIGH);
+  } 
+}
+
+// Turn LED off
+static inline void ledOff(){ 
+  if(ledState){ 
+    ledState=false; 
+    digitalWrite(LED_PIN, LOW);
+  } 
+}
+
+// LED state machine (call periodically)
+static void kickRxBlink(){ 
+  ledOn(); 
+  rxBlinkUntil = millis()+LED_RX_ON_MS; 
+}
+
+// LED state machine (call periodically)
+static void kickTxBlink(){ 
+  txBlinkPhase=1; 
+  ledOn(); 
+  txPhaseUntil = millis()+LED_TX_ON_MS; 
+}
 
 // Dedup housekeeping
 static void dedupCleanup(){
@@ -177,26 +258,72 @@ static size_t capServer(){
   return cap;
 }
 
-// Enfileirar pacote (sem bloquear)
+// Enqueue (with origin)
 static void txEnqueueFrom(const uint8_t* p, size_t n, int origin){
   if(!p || n==0) return;
   TxItem it; it.pkt.assign(p, p+n); it.origin = origin;
   xSemaphoreTake(gTxMutex, portMAX_DELAY);
-  //if(gTxQ.size()<128) gTxQ.push(std::move(it)); else gDropsBackpressure++;
   if(gTxQ.size() < MAX_TX_QUEUE) {
     gTxQ.push(std::move(it));
   } else {
-    // Descarta o MAIS ANTIGO e insere o novo (mantém fluxo atual)
+    // drop oldest
     gTxQ.pop();
     gTxQ.push(std::move(it));
     gDropsBackpressure++;
   }
   xSemaphoreGive(gTxMutex);
 }
-static void txEnqueue(const uint8_t* p, size_t n){ txEnqueueFrom(p,n,-1); }
 
-// Worker de TX: rate-limited; fan-out por conexão; sem eco
-// Worker de TX: token-bucket global, fan-out por conexão, fragmentação por peer (sem eco)
+// Enqueue (no origin)
+static void txEnqueue(const uint8_t* p, size_t n){ 
+  txEnqueueFrom(p,n,-1); 
+}
+
+#if ESP_BH  
+// Worker de RX do ESPNOW
+static void bhRxWorker(void*) {
+  for (;;) {
+    // === Backhaul ingress: ESPNOW -> (dedup/TTL--) -> BLE e re-flood ESPNOW ===
+    while (gEspNow.rxAvailable()) {
+      uint8_t buf[espn::MAX_FRAME];
+      size_t  n = sizeof(buf);
+      if (!gEspNow.rx(buf, &n, /*timeout_ms*/0)) break;
+      if (n < MIN_PKT_LEN || buf[0] != 0x01) continue;
+
+      // Dedup (mesma regra do caminho BLE)
+      size_t hdr = (n < 19) ? n : 19;
+      uint8_t hdrNoTTL[19]; memcpy(hdrNoTTL, buf, hdr); if (hdr >= 3) hdrNoTTL[2] = 0;
+      size_t extra = (n > hdr) ? ((n - hdr) < 32 ? (n - hdr) : 32) : 0;
+      uint64_t h = fnv1a64(hdrNoTTL, hdr); if (extra) h ^= fnv1a64(buf + hdr, extra);
+      if (dedupSeen(h)) { gDropsDedup++; continue; }
+
+      // LOG de RX (antes do TTL--)
+      if (debugLevel >= 2) {
+        char sid[17]; hex8(&buf[11], sid);
+        safePrintf("[ESPN-RX] type=%u len=%u ttl=%u sid=%s\r\n",
+                  buf[1], (unsigned)n, buf[2], sid);
+      }
+
+      // Contadores e LED
+      kickRxBlink(); gPktsIn++; gBytesIn += n;
+
+      // TTL--
+      if (buf[2] == 0) continue;
+      buf[2]--;
+      if (buf[2] == 0) continue;
+
+      // 1) entrega aos centrals BLE
+      relayToCentrals(buf, n, -1);
+
+      // 2) re-flood no backhaul (o log de TX sai em relayToBackhaul)
+      relayToBackhaul(buf, n);
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+#endif
+
+// Worker de TX: rate-limited; global token-bucket, connection fan-out, per-peer fragmentation (no echo)
 static void txWorker(void*) {
   for (;;) {
     uint32_t ms = millis();
@@ -205,7 +332,7 @@ static void txWorker(void*) {
       gLastTokenRefill = ms;
     }
 
-    // Pegar item da fila (se houver token disponível)
+    // Take one from queue if we have tokens
     xSemaphoreTake(gTxMutex, portMAX_DELAY);
     bool has = !gTxQ.empty() && gNotifyTokens > 0;
     TxItem it;
@@ -221,20 +348,20 @@ static void txWorker(void*) {
       continue;
     }
 
-    // Fan-out para inscritos (sem eco), com MTU/capacidade por conexão
+    // Subscribed peers fan-out
     bool anySent = false;
     for (auto &kv : gSubscribed) {
       uint16_t h = kv.first;
-      if (!kv.second) continue;                    // não quer notify
-      if (it.origin >= 0 && h == (uint16_t)it.origin) continue; // evita eco
+      if (!kv.second) continue;             // not subscribed
+      if (it.origin >= 0 && h == (uint16_t)it.origin) continue; // no echo to origin
 
-      // MTU/cap por peer
+      // MTU/cap by peer
       uint16_t mtu = DEFAULT_MTU;
       auto itM = gPeerMtus.find(h);
       if (itM != gPeerMtus.end()) mtu = itM->second;
       size_t capPeer = (mtu > 3) ? (mtu - 3) : FALLBACK_CAP;
 
-      // Cabe direto neste peer?
+      // fits directly on this peer?
       if (it.pkt.size() <= capPeer) {
         gChar->setValue(it.pkt.data(), it.pkt.size());
         if (gChar->notify(h)) {
@@ -244,24 +371,24 @@ static void txWorker(void*) {
         continue;
       }
 
-      // Precisa fragmentar para ESTE peer?
+      // Needs fragmentation to this peer?
       if (capPeer < 32) {
-        // inviável (overhead de 19+13 já passa do limite típico do ATT23)
+        // too small even for fragment header
         if (debugLevel >= 2) {
           char sid[17]; hex8(&it.pkt[11], sid);
-          Serial.printf("[REL] drop (cap<32) len=%u cap=%u peer=%u sid=%s\r\n",
+          Serial.printf("[REL-DROP] (cap<32) len=%u cap=%u peer=%u sid=%s\r\n",
                         (unsigned)it.pkt.size(), (unsigned)capPeer, (unsigned)h, sid);
         }
         continue;
       }
 
-      // Fragmentação por peer: FRAGMENT_TYPE com (fragID, idx, total, origType)
+      // by peer fragmentation
       const size_t overhead = 19 + 13;                 // header bitchat (19) + frag hdr (13)
       size_t maxChunk = (capPeer > overhead) ? (capPeer - overhead) : 0;
       if (maxChunk == 0) {
         if (debugLevel >= 2) {
           char sid[17]; hex8(&it.pkt[11], sid);
-          Serial.printf("[REL] drop (cap<=overhead) len=%u cap=%u peer=%u sid=%s\r\n",
+          Serial.printf("[REL-DROP] (cap<=overhead) len=%u cap=%u peer=%u sid=%s\r\n",
                         (unsigned)it.pkt.size(), (unsigned)capPeer, (unsigned)h, sid);
         }
         continue;
@@ -273,11 +400,11 @@ static void txWorker(void*) {
 
       for (size_t off = 0, idx = 0; off < it.pkt.size(); off += maxChunk, idx++) {
         size_t clen = std::min(maxChunk, it.pkt.size() - off);
-        // 19 bytes de header base
-        //   [0]=0x01, [1]=FRAGMENT_TYPE, [2]=TTL (preserva do original)
-        //   [3..10]=timestamp(8), [11..18]=senderID(8)
-        // + 13 bytes de header de fragmento:
-        //   [19..26]=fragID(8), [27..28]=idx(2), [29..30]=total(2), [31]=origType
+        // 19 bytes (base header)
+        // [0]=0x01, [1]=FRAGMENT_TYPE, [2]=TTL keep untouched
+        // [3..10]=timestamp(8), [11..18]=senderID(8)
+        // + 13 bytes fragment header
+        // [19..26]=fragID(8), [27..28]=idx(2), [29..30]=total(2), [31]=origType
         uint8_t pkt[600];
         pkt[0]  = 0x01;
         pkt[1]  = FRAGMENT_TYPE;
@@ -310,7 +437,7 @@ static void txWorker(void*) {
 
       if (debugLevel >= 3) {
         char sid[17]; hex8(&it.pkt[11], sid);
-        Serial.printf("[REL] fragmented len=%u cap=%u peers=%u peer=%u sid=%s\r\n",
+        Serial.printf("[REL-FRAG] len=%u cap=%u peers=%u peer=%u sid=%s\r\n",
                       (unsigned)it.pkt.size(), (unsigned)capPeer,
                       (unsigned)gPeerMtus.size(), (unsigned)h, sid);
       }
@@ -334,14 +461,16 @@ static uint32_t nextAnnounceDue(){ return ANNOUNCE_INTERVAL_MS + gAnnounceJitter
 static void refreshAnnounceJitter(){ gAnnounceJitter = 500 + (esp_random()%4500); }
 static void sendAnnounce(){
   uint8_t buf[51];
-  buf[0]=0x01; buf[1]=ANNOUNCE_TYPE; buf[2]=7;
+  buf[0]=0x01; 
+  buf[1]=ANNOUNCE_TYPE; 
+  buf[2]=7;
   writeU64BE(&buf[3], nowMs());
   memcpy(&buf[11], gSenderID, 8);
   memset(&buf[19], 0, 32);
   txEnqueue(buf, sizeof(buf));
   gLastAnnounce = millis();
   refreshAnnounceJitter();
-  DBG(3, "Announce enqueued");
+  safePrintf("[BLE-ANN] Announce sent\r\n");
 }
 
 // Limpeza de reassembly
@@ -374,9 +503,13 @@ static void cleanupFragments(){
 static void sendFragmentedNotifyFrom(const uint8_t* orig, size_t origLen, size_t cap, int origin){
   size_t maxChunk = cap>=32? cap-32 : MIN_CHUNK_SIZE;
   size_t nfr = (origLen + maxChunk - 1)/maxChunk;
-  if(nfr==0 || nfr>65535 || cap<32){ DBG(2,"Invalid fragmentation, drop"); return; }
+  if(nfr==0 || nfr>65535 || cap<32){ 
+    safePrintf("[FRG-DROP] Invalid fragmentation, drop\r\n");
+    return; 
+  }
   uint8_t origType = orig[1];
-  uint8_t fragID[8]; for(int i=0;i<8;i++) fragID[i]=(uint8_t)esp_random();
+  uint8_t fragID[8]; 
+  for(int i=0;i<8;i++) fragID[i]=(uint8_t)esp_random();
   for(size_t idx=0; idx<nfr; idx++){
     size_t off = idx*maxChunk, clen = std::min(maxChunk, origLen-off);
     uint8_t pkt[600];
@@ -391,6 +524,12 @@ static void sendFragmentedNotifyFrom(const uint8_t* orig, size_t origLen, size_t
     memcpy(fp+13, orig+off, clen);
     size_t len = 19+13+clen;
     txEnqueueFrom(pkt, len, origin);
+    // Log
+    if (debugLevel>=3){
+      char sid[17]; hex8(&orig[11], sid);
+      Serial.printf("[FRG-ENQ] enq frag idx=%u/%u len=%u cap=%u sid=%s\r\n",
+        (unsigned)idx, (unsigned)nfr, (unsigned)len, (unsigned)cap, sid);
+    }
   }
 }
 
@@ -400,7 +539,7 @@ static void relayToCentrals(const uint8_t* pkt, size_t len, int origin){
     txEnqueueFrom(pkt, len, origin);
     if(debugLevel >= 3){
       char sid[17]; hex8(&pkt[11], sid);
-      Serial.printf("[REL] direct len=%u cap=%u peers=%u sid=%s\r\n",
+      Serial.printf("[BLE-REL] direct len=%u cap=%u peers=%u sid=%s\r\n",
         (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
     }
   } else {
@@ -408,18 +547,35 @@ static void relayToCentrals(const uint8_t* pkt, size_t len, int origin){
       sendFragmentedNotifyFrom(pkt, len, cap, origin);
       if (debugLevel >= 3) {
         char sid[17]; hex8(&pkt[11], sid);
-        Serial.printf("[REL] fragmented len=%u cap=%u peers=%u sid=%s\r\n",
+        Serial.printf("[BLE-REL] fragmented len=%u cap=%u peers=%u sid=%s\r\n",
           (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
       }
     } else {
-      if (debugLevel >= 2) {
+      if (debugLevel >= 3) {
         char sid[17]; hex8(&pkt[11], sid);
-        Serial.printf("[REL] drop (cap<32) len=%u cap=%u peers=%u sid=%s\r\n",
+        Serial.printf("[BLE-REL] drop (cap<32) len=%u cap=%u peers=%u sid=%s\r\n",
           (unsigned)len, (unsigned)cap, (unsigned)gPeerMtus.size(), sid);
       }
     }
   }
 }
+
+#if ESP_BH
+// === Backhaul (ESPNOW) fan-out ===
+static inline void relayToBackhaul(const uint8_t* pkt, size_t len) {
+  if (!pkt || len < MIN_PKT_LEN || pkt[0] != 0x01) return;
+  uint8_t type = pkt[1];
+  uint8_t ttl  = (len >= 3) ? pkt[2] : 0;
+  char sid[17]; hex8(&pkt[11], sid);
+  if (debugLevel >= 2) {
+    safePrintf("[ESPN-TX] type=%u len=%u ttl=%u sid=%s\r\n",
+               type, (unsigned)len, ttl, sid);
+  }
+  if (!gEspNow.tx(pkt, len)) {
+    safePrintf("[ESPN-TX] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
+  }
+}
+#endif
 
 // ===== Callbacks NimBLE 2.3.6 =====
 class SvrCallbacks: public NimBLEServerCallbacks {
@@ -428,21 +584,21 @@ class SvrCallbacks: public NimBLEServerCallbacks {
     // se já atingiu o teto, desconecta imediatamente
     if (gPeerMtus.size() > MAX_PEERS) {
       if (gServer)gServer->disconnect(info.getConnHandle());
-      DBG(2, String("Max peers reached, disconnecting new central (ch=") + String(info.getConnHandle()) + ")");
+      safePrintf("[CLI-DROP] Max peers reached, disconnecting new central (ch=%u)\r\n", (unsigned)info.getConnHandle());
       return;
     }
-    DBG(3, String("Central connected (ch=") + String(info.getConnHandle()) + ")");
+    safePrintf("[CLI-CONN] Central connected (ch=%u)\r\n", (unsigned)info.getConnHandle());
     NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int reason) override {
     gPeerMtus.erase(info.getConnHandle());
     gSubscribed.erase(info.getConnHandle());
-    DBG(3, String("Central disconnected (ch=") + String(info.getConnHandle()) + String(", reason=") + String(reason) + ")");
+    safePrintf("[CLI-DISC] Central disconnected (ch=%u, reason=%d)\r\n", (unsigned)info.getConnHandle(), reason);
     NimBLEDevice::startAdvertising();
   }
   void onMTUChange(uint16_t mtu, NimBLEConnInfo& info) override {
     gPeerMtus[info.getConnHandle()] = mtu;
-    DBG(3, String("MTU updated (ch=") + String(info.getConnHandle()) + String(", mtu=") + String(mtu) + ")");
+    safePrintf("[CLI-MTU] MTU updated (ch=%u, mtu=%u)\r\n", (unsigned)info.getConnHandle(), (unsigned)mtu);
   }
 };
 
@@ -450,7 +606,7 @@ class CharCallbacks: public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo& info, uint16_t subVal) override {
     bool wantsNotify = (subVal & 0x0001);
     gSubscribed[info.getConnHandle()] = wantsNotify;
-    DBG(3, String("Subscribe ch=") + String(info.getConnHandle()) + String(" notify=") + String(wantsNotify));
+    safePrintf("[CLI-SUB] Subscribe ch=%u notify=%u\r\n", (unsigned)info.getConnHandle(), (unsigned)wantsNotify);
   }
 
   void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& info) override {
@@ -467,10 +623,13 @@ class CharCallbacks: public NimBLECharacteristicCallbacks {
 
     if (dedupSeen(h)) { 
       gDropsDedup++; 
-      if(debugLevel>=2){
-        uint8_t ttl=p[2]; uint64_t ts=0; for(int i=0;i<8;i++) ts=(ts<<8)|p[3+i];
-        char sid[17]; hex8(&p[11], sid);
-        Serial.printf("[PKT] **dropped** type=%u ttl=%u len=%u ts=%llu sid=%s\r\n",
+      if(debugLevel>=3){
+        uint8_t ttl=p[2]; 
+        uint64_t ts=0; 
+        for(int i=0;i<8;i++) ts=(ts<<8)|p[3+i];
+        char sid[17]; 
+        hex8(&p[11], sid);
+        Serial.printf("[PKT-DEDUP] type=%u ttl=%u len=%u ts=%llu sid=%s\r\n",
                     p[1], ttl, (unsigned)len, (unsigned long long)ts, sid);
       }
       return; 
@@ -479,16 +638,17 @@ class CharCallbacks: public NimBLECharacteristicCallbacks {
     if(debugLevel>=2){
       uint8_t ttl=p[2]; uint64_t ts=0; for(int i=0;i<8;i++) ts=(ts<<8)|p[3+i];
       char sid[17]; hex8(&p[11], sid);
-      Serial.printf("[PKT] in type=%u ttl=%u len=%u ts=%llu sid=%s\r\n",
+      Serial.printf("[PKT-IN] type=%u ttl=%u len=%u ts=%llu sid=%s\r\n",
                     p[1], ttl, (unsigned)len, (unsigned long long)ts, sid);
     }
 
     if (debugLevel >= 4) {
-      char sid[17]; hex8(&p[11], sid);
+      char sid[17]; 
+      hex8(&p[11], sid);
       uint8_t sniff[8] = {0};
       size_t sniffLen = (len > 27) ? 8 : (len > 19 ? len - 19 : 0);
       if (sniffLen) memcpy(sniff, p + 19, sniffLen);
-      Serial.printf("[SNIFF] sid=%s type=%u len=%u ttl=%u p0=%02X p1=%02X p2=%02X p3=%02X p4=%02X p5=%02X p6=%02X p7=%02X\r\n",
+      Serial.printf("[PKT-DATA] sid=%s type=%u len=%u ttl=%u [%02X %02X %02X %02X %02X %02X %02X %02X]\r\n",
         sid, p[1], (unsigned)len, p[2],
         sniff[0],sniff[1],sniff[2],sniff[3],sniff[4],sniff[5],sniff[6],sniff[7]);
     }
@@ -497,21 +657,32 @@ class CharCallbacks: public NimBLECharacteristicCallbacks {
     kickRxBlink();
 
     static uint8_t buf[600]; if(len>sizeof(buf)) return; memcpy(buf, p, len);
-// TTL handling: drop when zero and after decrement if it hits zero
-if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl=0 before relay"); return; }
-buf[2]--; /* TTL-- */
-if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl expired after --"); return; }
+    // TTL handling: drop when zero and after decrement if it hits zero
+    if (buf[2] == 0) { 
+      if (debugLevel>=2) Serial.println("[PKT-DROP] ttl=0 before relay"); 
+      return; 
+    }
+    buf[2]--; /* TTL-- */
+    if (buf[2] == 0) { 
+      if (debugLevel>=2) Serial.println("[PKT-DROP] ttl expired after --"); 
+      return; 
+    }
 
     if(p[1]==FRAGMENT_TYPE){
       if(len < 19+13) return;
-      uint64_t sender=0; for(int i=0;i<8;i++) sender=(sender<<8)|p[11+i];
-      uint64_t fragID=0; for(int i=0;i<8;i++) fragID=(fragID<<8)|p[19+i];
+      uint64_t sender=0; 
+      for(int i=0;i<8;i++) sender=(sender<<8)|p[11+i];
+
+      uint64_t fragID=0; 
+      for(int i=0;i<8;i++) fragID=(fragID<<8)|p[19+i];
+
       uint16_t index=(p[27]<<8)|p[28], total=(p[29]<<8)|p[30];
-      uint8_t origType=p[31]; size_t chunkLen = len-32; if(total==0 || index>=total) return;
+      uint8_t origType=p[31]; 
+      size_t chunkLen = len-32; 
+      if(total==0 || index>=total) return;
 
       FragmentKey key{sender, fragID};
       if(incomingFragments.find(key)==incomingFragments.end()){
-
         // Enforce cota por remetente ANTES de criar assembly
         size_t bs = gInflightBytesBySender[sender];
         uint16_t fs = gInflightFragsBySender[sender];
@@ -545,9 +716,8 @@ if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl expired after -
           auto oldest = fragmentMetadata.begin();
           for (auto it2 = fragmentMetadata.begin(); it2 != fragmentMetadata.end(); ++it2)
             if (it2->second.second < oldest->second.second) oldest = it2;
-          auto mapIt = incomingFragments.find(oldest->first);
-          //if (mapIt != incomingFragments.end()) { for (auto &kv : mapIt->second) gInflightBytes -= kv.second.size(); incomingFragments.erase(mapIt); }
 
+          auto mapIt = incomingFragments.find(oldest->first);          
           if (mapIt != incomingFragments.end()) {
             // Ajusta globais e POR SENDER
             uint64_t oldSender = oldest->first.sender;
@@ -561,25 +731,19 @@ if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl expired after -
 
           fragmentMetadata.erase(oldest);
         }
-        //incomingFragments[key] = {}; fragmentMetadata[key] = {origType, nowMs()};
-
         incomingFragments[key] = {};
         fragmentMetadata[key] = {origType, nowMs()};
         gInflightFragsBySender[sender]++; // novo assembly deste sender
-
       }
       if(incomingFragments[key].find(index)==incomingFragments[key].end()){
-        //incomingFragments[key][index] = std::vector<uint8_t>(p+32, p+len); gInflightBytes += chunkLen;
-
         incomingFragments[key][index] = std::vector<uint8_t>(p+32, p+len);
         gInflightBytes += chunkLen;
         gInflightBytesBySender[sender] += chunkLen;
 
       }
       if (incomingFragments[key].size() == total) {
-        size_t totalPay = 0; for (uint16_t i = 0; i < total; i++) totalPay += incomingFragments[key][i].size();
-        //if (totalPay > 4096) { for (auto &kv : incomingFragments[key]) gInflightBytes -= kv.second.size(); incomingFragments.erase(key); fragmentMetadata.erase(key); return; }
-
+        size_t totalPay = 0; 
+        for (uint16_t i = 0; i < total; i++) totalPay += incomingFragments[key][i].size();
         if (totalPay > 4096) {
           // muito grande: descarta reassembly, ajustando contadores por sender
           for (auto &kv : incomingFragments[key]) {
@@ -591,13 +755,9 @@ if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl expired after -
           if (gInflightFragsBySender[sender] > 0) gInflightFragsBySender[sender]--;
           return;
         }
-
         // Reassembly: concatenate original bytes exactly (no header rebuild)
         std::vector<uint8_t> whole; whole.reserve(totalPay);
         for (uint16_t i = 0; i < total; i++) { auto &ch = incomingFragments[key][i]; whole.insert(whole.end(), ch.begin(), ch.end()); }
-        //for (auto &kv : incomingFragments[key]) gInflightBytes -= kv.second.size();
-        //incomingFragments.erase(key); fragmentMetadata.erase(key);
-
         // Finaliza: limpa contadores global e por sender
         for (auto &kv : incomingFragments[key]) {
           gInflightBytes -= kv.second.size();
@@ -606,23 +766,35 @@ if (buf[2] == 0) { if (debugLevel>=2) Serial.println("[DROP] ttl expired after -
         incomingFragments.erase(key);
         fragmentMetadata.erase(key);
         if (gInflightFragsBySender[sender] > 0) gInflightFragsBySender[sender]--;
-
         relayToCentrals(whole.data(), whole.size(), (int)info.getConnHandle());
+#if ESP_BH        
+        // também propaga no backhaul (TTL já foi -- lá em cima)
+        relayToBackhaul(whole.data(), whole.size());        
+#endif        
       }
     } else {
       relayToCentrals(buf, len, (int)info.getConnHandle());
+#if ESP_BH      
+      // e backhaul
+      relayToBackhaul(buf, len);
+#endif      
     }
   }
 };
 
 // ===== Setup BLE (server) =====
 static void setup_ble_server(){
-  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_BT);
-  char suf[7]; sprintf(suf, "%02X%02X%02X", mac[3], mac[4], mac[5]);
-  String devName="BitChatRelay_"; devName+=suf;
+  uint8_t mac[6]; 
+  esp_read_mac(mac, ESP_MAC_BT);
+
+  char suf[7]; 
+  sprintf(suf, "%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+  String devName="BitChatRelay_"; 
+  devName+=suf;
 
   NimBLEDevice::init(devName.c_str());
-  NimBLEDevice::setPower(9);          // dBm
+  NimBLEDevice::setPower(BLE_POWER);          // dBm
   NimBLEDevice::setMTU(REQUESTED_MTU);
 
   gServer = NimBLEDevice::createServer();
@@ -644,31 +816,55 @@ static void setup_ble_server(){
   adv->setName(devName.c_str());
   adv->addServiceUUID(BITCHAT_SERVICE_UUID_MAINNET);
   adv->enableScanResponse(true);
-  //adv->setPreferredParams(0x06, 0x06);
   adv->setPreferredParams(0x50, 0xA0); // 50ms to 100ms (ms = param * 0.625)
   NimBLEDevice::startAdvertising();
   gServer->advertiseOnDisconnect(true);
 
-  DBG(1, "Peripheral ready (HUB). Advertising service.");
+  safePrintf("[BLE] Peripheral ready (HUB). Advertising service...\r\n");
+}
+
+// ===== Setup ESPNOW =====
+static void setup_espn(){
+  uint8_t mac[6]; 
+  WiFi.macAddress(mac);
+
+  if (!gEspNow.init(NET_ID, mac, ESP_BH_CHANNEL, ESP_BH_LINK_MTU, ESP_BH_TX_CORE, ESP_BH_RX_CORE, ESP_BH_BALANCED_SPLIT)) {
+    Serial.println("espn init FAIL");
+    for(;;) delay(1000);
+  }
+  safePrintf("[ESPN] ESPNOW initialized on channel %u\r\n", ESP_BH_CHANNEL);
+
+  // BH RX worker
+  xTaskCreatePinnedToCore(bhRxWorker, "bhrxw", 4096, nullptr, 3, nullptr, 0);
 }
 
 // ===== Arduino entry points =====
 void setup(){
   Serial.begin(115200);
   delay(100);
-  WiFi.mode(WIFI_OFF);
-  pinMode(LED_PIN, OUTPUT); ledOff();
+
+  pinMode(LED_PIN, OUTPUT); 
+  ledOff();
+
+  safePrintf("\r\n=== BitChat Relay v%s ===\r\n", VERSION);
+  safePrintf("Compiled: %s %s\r\n", __DATE__, __TIME__);
+  safePrintf("Free heap: %u bytes\r\n", ESP.getFreeHeap());
 
   makeSenderID();
   setup_ble_server();
 
+#if ESP_BH
+  setup_espn();
+#endif
+
+  gSerialMutex = xSemaphoreCreateMutex();
   gTxMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(txWorker, "txw", 4096, nullptr, 3, nullptr, 0);
   gLastTokenRefill = millis(); gNotifyTokens = gNotifyBudgetPerSec;
 
   refreshAnnounceJitter();
   sendAnnounce();
-  DBG(1, "Setup done.");
+  safePrintf("[BLE] Setup done.\r\n");
   gLastStats = millis();
 }
 
@@ -698,38 +894,46 @@ void loop(){
     size_t qsz; xSemaphoreTake(gTxMutex, portMAX_DELAY); qsz=gTxQ.size(); xSemaphoreGive(gTxMutex);
 
     String mtuList="MTUs: ";
-    for(auto &kv: gPeerMtus) mtuList+="ch="+String(kv.first)+":mtu="+String(kv.second)+" ";
+    uint8_t cnt=0;
+    for(auto &kv: gPeerMtus) {
+      cnt++;
+      mtuList+="ch="+String(kv.first)+":mtu="+String(kv.second)+" ";
+      if (cnt==4) mtuList+="\r\n";
+    }
 
     uint32_t centrals = gPeerMtus.size();
     uint32_t subs = 0; for (auto &kv: gSubscribed) if (kv.second) subs++;
 
-    Serial.println("=== BitChat Relay Status ===");
-    Serial.printf("[STAT] pktsIn=%u bytesIn=%u pktsOut=%u bytesOut=%u writes=%u notifies=%u heap=%u minCap=%u q=%u tokens=%u dedupWin=%u drops{dedup=%u,backp=%u} inflightB=%u t1_in=%u t2_in=%u peers=%u subs{notify=%u} %s\r\n",
+    Serial.println("==================================[STATUS]==================================");
+    Serial.printf("pktsIn: %u | bytesIn: %u | pktsOut: %u | bytesOut: %u | writes: %u | notifies: %u \r\nheap: %u | minCap: %u | q: %u | tokens: %u | dedupWin: %u | drops{dedup: %u, backp: %u} \r\ninflightB: %u | t1_in: %u | t2_in: %u | peers: %u | subs{notify: %u} \r\n%s \r\n",
       gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies,
       ESP.getFreeHeap(), (unsigned)cap, (unsigned)qsz, (unsigned)gNotifyTokens,
       (unsigned)gSeenDeque.size(), (unsigned)gDropsDedup, (unsigned)gDropsBackpressure,
       (unsigned)gInflightBytes, gType1In, gType2In,
       centrals, subs, mtuList.c_str());
-    Serial.println("=== End Status ===");
+    Serial.println("============================================================================");
   }
 
   // Comandos seriais
-  if (Serial.available()) {
-    char k = Serial.read();
-    switch (k) {
-      case 'r':
-        ESP.restart();
-        break;
-      case '+':
-        if (debugLevel < 5) debugLevel++;
-        Serial.printf("Debug level now %d\r\n", debugLevel);
-        break;
-      case '-':
-        if (debugLevel > 0) debugLevel--;
-        Serial.printf("Debug level now %d\r\n", debugLevel);
-        break;        
+  if (gSerialMutex) {
+    xSemaphoreTake(gSerialMutex, portMAX_DELAY);
+    if (Serial.available()) {
+      char k = Serial.read();
+      switch (k) {
+        case 'r':
+          ESP.restart();
+          break;
+        case '+':
+          if (debugLevel < 5) debugLevel++;
+          Serial.printf("Debug level now %d\r\n", debugLevel);
+          break;
+        case '-':
+          if (debugLevel > 0) debugLevel--;
+          Serial.printf("Debug level now %d\r\n", debugLevel);
+          break;        
+      }
     }
-  }
-
+    xSemaphoreGive(gSerialMutex);
+  }  
   vTaskDelay(10);
 }

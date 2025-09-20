@@ -37,6 +37,25 @@ It never acts as a BLE client or scanner. Focus: *low latency, predictable memor
 - **Periodic ANNOUNCE** every **30 s + jitter (0.5–4.5 s)**
 - **LED feedback** (optional) — RX: single blink; TX: double blink
 - **Structured logs** for packets and 10-second status snapshots
+- **ESP-Now! Backhaul** connect and exchange packets between other HUBs using ESPNow!
+
+---
+
+## 🛰️ Backhaul over ESP-NOW (NEW)
+
+Adds a **hub↔hub backbone** using **ESP-NOW** (backhaul) while keeping phones on **BLE** (fronthaul).
+
+### What it brings
+
+* **Dedicated backbone**: shared `NET_ID` (8B), fixed **channel** (1/6/11), configurable **link MTU** (≤250).
+* **Balanced fragmentation** (`balanced_split=true`): splits frames into **near-equal chunks** (Δ≤1B).
+  RX reassembles using `(total, cnt, idx)` only → **works even if MTUs differ** across nodes.
+* **Per-frame reliability (ARQ)**: after full reassembly, receiver unicasts an **ACK** (control frame) to sender’s MAC.
+  Sender waits `ACK_TIMEOUT_MS` and **retries up to `MAX_RETRIES`**.
+* **Bounded reassembly RAM**: 6 parallel slots; GC after `LLF_TIMEOUT_MS` (500 ms).
+* **BLE+Wi-Fi coexistence sane defaults**: `WiFi.setSleep(true)` + `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` (+ optional `esp_coex_preference_set(ESP_COEX_PREFER_BALANCE)`).
+* **PHY options**: **Long Range (LR)** enabled by default (robust/longer range). Optional 802.11b **1 Mb/s** if you prefer less airtime.
+* **TX power**: `WiFi.setTxPower(WIFI_POWER_19_5dBm)` (adjust to your EIRP/regulatory).
 
 ---
 
