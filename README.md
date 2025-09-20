@@ -150,6 +150,39 @@ inflightB=… t1_in=… t2_in=… peers=… subs{notify=…} MTUs: ch=H:mtu=M �
 
 ---
 
+## Privacy & Security
+
+**Transport-only relay.**  
+This hub is intentionally dumb: it relays BitChat frames as-is. It never decrypts, parses or rewrites the payload. The only header changes are:
+- TTL is **validated** and **decremented**; frames with `TTL=0` are dropped.
+- When needed, the hub **fragments** large frames and peers **reassemble**.
+
+### What is (and isn't) collected
+- **No payload storage.** The hub does not persist payloads. Fragment buffers are in RAM only and are evicted on completion/timeout (≤30 s) with strict global and per-sender limits.
+- **No scanning / no client role.** The device never scans or initiates connections.
+- **Stats/logs** include *only* metadata (type, TTL, length, timestamp, senderID, MTUs, counters).  
+  ⚠️ At `debugLevel >= 4` a short 8-byte payload **sniff** is printed for troubleshooting. Use `debugLevel <= 3` in production to avoid any payload leakage.
+- **De-dup hash.** To suppress loops, the hub keeps a **non-cryptographic FNV-1a 64-bit hash** of the 19-byte header (with TTL zeroed) plus up to 32 bytes of payload. Hashes are kept ~60 s, then evicted. This is not a cryptographic commitment and is used only for duplicate detection.
+
+### Identifiers & linkability
+- The **senderID (8 bytes)** defaults to a deterministic value derived from hardware (BT MAC + eFuse). This helps diagnostics but is **linkable** across time/places. If unlinkability is desired, derive `senderID` from an **ephemeral key** or **randomize per boot** upstream.
+
+### BLE link security
+- The characteristic is open to `READ/WRITE/WRITE_NR/NOTIFY` and does **not** require pairing/bonding or link-layer encryption by default. Treat the hub as an **untrusted transport** and enforce **end-to-end encryption + integrity** at the BitChat/application layer (e.g., AEAD with nonces, replay protection).
+- If your deployment needs link privacy, consider enabling BLE privacy/RPA and encrypted characteristics (depends on your NimBLE build/central support).
+
+### Side effects of MTU/capacity
+- When any peer connects with **MTU 23**, the global capacity (`minCap`) becomes **20 B**, which prevents outbound fragmentation to that peer (`cap < 32`). Payload remains opaque; only reachability changes.
+
+### DoS considerations
+- TX is rate-limited (token bucket) and queue-bounded; inbound writes are still a potential flood vector. In hostile environments, rate-limit inbound per connection and/or require application-layer auth.
+
+### Recommendations
+- Always use **end-to-end encryption & signatures** in BitChat payloads.
+- Keep `debugLevel <= 3` in production.
+- Rotate or derive `senderID` from session keys if you need unlinkability.
+- If needed, modify the dedup hash to operate over **ciphertext only** (still works, avoids hashing plaintext bytes).
+
 ## 🔍 Troubleshooting
 
 - **Nothing received by phone**  
