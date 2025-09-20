@@ -134,6 +134,7 @@ inflightB=… t1_in=… t2_in=… peers=… subs{notify=…} MTUs: ch=H:mtu=M �
 
 - **ESP32 Arduino Core** (tested with `esp32:esp32 2.0.x`)
 - **NimBLE-Arduino ≥ 2.3.6**
+- Board: **DOIT ESP32 DevKit v1**
 - Serial: **115200**
 - Optional: define `LED_PIN` (default `2`)
 
