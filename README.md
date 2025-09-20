@@ -183,6 +183,8 @@ This hub is intentionally dumb: it relays BitChat frames as-is. It never decrypt
 - Rotate or derive `senderID` from session keys if you need unlinkability.
 - If needed, modify the dedup hash to operate over **ciphertext only** (still works, avoids hashing plaintext bytes).
 
+---
+
 ## 🔍 Troubleshooting
 
 - **Nothing received by phone**  
