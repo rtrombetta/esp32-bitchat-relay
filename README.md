@@ -150,7 +150,7 @@ inflightB=… t1_in=… t2_in=… peers=… subs{notify=…} MTUs: ch=H:mtu=M �
 
 ---
 
-## Privacy & Security
+## 🔒 Privacy & Security
 
 **Transport-only relay.**  
 This hub is intentionally dumb: it relays BitChat frames as-is. It never decrypts, parses or rewrites the payload. The only header changes are:
