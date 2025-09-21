@@ -219,7 +219,7 @@ void espn::txTask() {
   TxItem it{};
   for (;;) {
     if (xQueueReceive(m_txQ, &it, portMAX_DELAY) == pdTRUE) {
-      if (m_debug >= 3) safeLog("[ESPN-TXDEQ] len=%u\r\n", (unsigned)it.len);
+      if (m_debug >= 4) safeLog("[ESPN-TXDEQ] len=%u\r\n", (unsigned)it.len);
       llf_sendFrame(it.buf, it.len);
     }
   }
@@ -237,7 +237,7 @@ void espn::rxTask() {
         if (r.len > MAX_FRAME) r.len = MAX_FRAME;
         memcpy(r.buf, full, r.len);
         xQueueSend(m_rxQ, &r, 0);
-        if (m_debug >= 3) safeLog("[ESPN-RXENQ] len=%u\r\n", (unsigned)r.len);
+        if (m_debug >= 4) safeLog("[ESPN-RXENQ] len=%u\r\n", (unsigned)r.len);
       }
     }
     llf_gc();
@@ -269,7 +269,7 @@ bool espn::llf_sendFrame(const uint8_t* frame, size_t flen) {
   m_ack_mask_expect   = (m_nPeers > 0) ? (uint16_t)((1u << m_nPeers) - 1u) : 0;
 
   for (uint8_t attempt = 0; attempt <= (RELIABLE ? MAX_RETRIES : 0); ++attempt) {
-    if (m_debug >= 3) safeLog("[ESPN-TX] gid=%u cnt=%u total=%u (attemp %u)\r\n",
+    if (m_debug >= 4) safeLog("[ESPN-TX] gid=%u cnt=%u total=%u (attemp %u)\r\n",
             gid, cnt, (uint16_t)flen, (uint32_t)(attempt + 1));
 
     // envia para cada peer que ainda não ACKou
@@ -439,7 +439,7 @@ bool espn::addPeer(const uint8_t mac[6]) {
   m_peers[m_nPeers].last_seen = now_ms();
   bool ok = ensurePeer(mac);
   if (ok) m_nPeers++;
-  if (m_debug >= 3) safeLog("[ESPN-PEER] Peer added: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+  if (m_debug >= 3) safeLog("[ESPN-DISC] Peer added: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return ok;
 }
@@ -450,7 +450,7 @@ bool espn::delPeer(const uint8_t mac[6]) {
   if (idx < 0) return false;
   for (int i=idx+1;i<m_nPeers;i++) m_peers[i-1]=m_peers[i];
   m_nPeers--;
-  if (m_debug >= 3) safeLog("[ESPN-PEER] Peer removed: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+  if (m_debug >= 3) safeLog("[ESPN-DISC] Peer removed: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return true;
 }

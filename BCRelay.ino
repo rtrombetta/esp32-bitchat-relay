@@ -291,7 +291,7 @@ static void bhRxWorker(void*) {
       if (n < MIN_PKT_LEN || buf[0] != 0x01) continue;
 
       // LOG de RX (antes do TTL--)
-      if (debugLevel >= 2) {
+      if (debugLevel >= 3) {
         char sid[17]; hex8(&buf[11], sid);
         safePrintf("[ESPN-RXDEQ] type=%u len=%u ttl=%u sid=%s\r\n",
                   buf[1], (unsigned)n, buf[2], sid);                  
@@ -306,7 +306,7 @@ static void bhRxWorker(void*) {
         gDropsDedup++; 
         if (debugLevel >= 3) {
           char sid[17]; hex8(&buf[11], sid);
-          safePrintf("[ESPN-DUP] type=%u len=%u ttl=%u sid=%s\r\n",
+          safePrintf("[ESPN-DEDUP] type=%u len=%u ttl=%u sid=%s\r\n",
                     buf[1], (unsigned)n, buf[2], sid);                  
         }
         continue; 
@@ -571,16 +571,19 @@ static void relayToCentrals(const uint8_t* pkt, size_t len, int origin){
 #if ESP_BH
 // === Backhaul (ESPNOW) fan-out ===
 static inline void relayToBackhaul(const uint8_t* pkt, size_t len) {
+  // não tenta enviar se não tiver peers
+  if (gEspNow.peerCount() == 0) {
+    if (debugLevel >= 2) safePrintf("[ESPN-TXENQ] no peers, skip\r\n");
+    return;
+  }
+
   if (!pkt || len < MIN_PKT_LEN || pkt[0] != 0x01) return;
   uint8_t type = pkt[1];
   uint8_t ttl  = (len >= 3) ? pkt[2] : 0;
   char sid[17]; hex8(&pkt[11], sid);
-  if (debugLevel >= 2) {
-    safePrintf("[ESPN-TXENQ] type=%u len=%u ttl=%u sid=%s\r\n",
-               type, (unsigned)len, ttl, sid);
-  }
+  if (debugLevel >= 3) safePrintf("[ESPN-TXENQ] type=%u len=%u ttl=%u sid=%s\r\n", type, (unsigned)len, ttl, sid);
   if (!gEspNow.tx(pkt, len)) {
-    safePrintf("[ESPN-TXENQ] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
+    if (debugLevel >= 1) safePrintf("[ESPN-TXENQ] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
   }
 }
 #endif
@@ -592,10 +595,10 @@ class SvrCallbacks: public NimBLEServerCallbacks {
     // se já atingiu o teto, desconecta imediatamente
     if (gPeerMtus.size() > MAX_PEERS) {
       if (gServer)gServer->disconnect(info.getConnHandle());
-      safePrintf("[CLI-DROP] Max peers reached, disconnecting new central (ch=%u)\r\n", (unsigned)info.getConnHandle());
+      if (debugLevel >= 1) safePrintf("[CLI-DROP] Max peers reached, disconnecting new central (ch=%u)\r\n", (unsigned)info.getConnHandle());
       return;
     }
-    safePrintf("[CLI-CONN] Central connected (ch=%u)\r\n", (unsigned)info.getConnHandle());
+    if (debugLevel >= 1) safePrintf("[CLI-CONN] Central connected (ch=%u)\r\n", (unsigned)info.getConnHandle());
     NimBLEDevice::startAdvertising();
   }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int reason) override {
@@ -776,7 +779,7 @@ class CharCallbacks: public NimBLECharacteristicCallbacks {
         if (gInflightFragsBySender[sender] > 0) gInflightFragsBySender[sender]--;
         relayToCentrals(whole.data(), whole.size(), (int)info.getConnHandle());
 #if ESP_BH        
-        // também propaga no backhaul (TTL já foi -- lá em cima)
+        // também propaga no backhaul (TTL já foi -- lá em cima)        
         relayToBackhaul(whole.data(), whole.size());        
 #endif        
       }
@@ -939,14 +942,14 @@ void loop(){
 #if ESP_BH
           gEspNow.setDebugLevel(debugLevel);
 #endif
-          Serial.printf("Debug level now %d\r\n", debugLevel);
+          Serial.printf("[DBG] Debug level now %d\r\n", debugLevel);
           break;
         case '-':
           if (debugLevel > 0) debugLevel--;
 #if ESP_BH
           gEspNow.setDebugLevel(debugLevel);
 #endif
-          Serial.printf("Debug level now %d\r\n", debugLevel);
+          Serial.printf("[DBG] Debug level now %d\r\n", debugLevel);
           break;
       }
     }
