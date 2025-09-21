@@ -79,7 +79,7 @@
 static uint8_t debugLevel = 3;
 
 // ===== Serial =====
-static SemaphoreHandle_t gSerialMutex;
+SemaphoreHandle_t gSerialMutex;
 
 // ==== ESPNOW backhaul =====
 static espn gEspNow;
@@ -290,18 +290,26 @@ static void bhRxWorker(void*) {
       if (!gEspNow.rx(buf, &n, /*timeout_ms*/0)) break;
       if (n < MIN_PKT_LEN || buf[0] != 0x01) continue;
 
+      // LOG de RX (antes do TTL--)
+      if (debugLevel >= 2) {
+        char sid[17]; hex8(&buf[11], sid);
+        safePrintf("[ESPN-RXDEQ] type=%u len=%u ttl=%u sid=%s\r\n",
+                  buf[1], (unsigned)n, buf[2], sid);                  
+      }
+
       // Dedup (mesma regra do caminho BLE)
       size_t hdr = (n < 19) ? n : 19;
       uint8_t hdrNoTTL[19]; memcpy(hdrNoTTL, buf, hdr); if (hdr >= 3) hdrNoTTL[2] = 0;
       size_t extra = (n > hdr) ? ((n - hdr) < 32 ? (n - hdr) : 32) : 0;
       uint64_t h = fnv1a64(hdrNoTTL, hdr); if (extra) h ^= fnv1a64(buf + hdr, extra);
-      if (dedupSeen(h)) { gDropsDedup++; continue; }
-
-      // LOG de RX (antes do TTL--)
-      if (debugLevel >= 2) {
-        char sid[17]; hex8(&buf[11], sid);
-        safePrintf("[ESPN-RX] type=%u len=%u ttl=%u sid=%s\r\n",
-                  buf[1], (unsigned)n, buf[2], sid);
+      if (dedupSeen(h)) { 
+        gDropsDedup++; 
+        if (debugLevel >= 3) {
+          char sid[17]; hex8(&buf[11], sid);
+          safePrintf("[ESPN-DUP] type=%u len=%u ttl=%u sid=%s\r\n",
+                    buf[1], (unsigned)n, buf[2], sid);                  
+        }
+        continue; 
       }
 
       // Contadores e LED
@@ -568,11 +576,11 @@ static inline void relayToBackhaul(const uint8_t* pkt, size_t len) {
   uint8_t ttl  = (len >= 3) ? pkt[2] : 0;
   char sid[17]; hex8(&pkt[11], sid);
   if (debugLevel >= 2) {
-    safePrintf("[ESPN-TX] type=%u len=%u ttl=%u sid=%s\r\n",
+    safePrintf("[ESPN-TXENQ] type=%u len=%u ttl=%u sid=%s\r\n",
                type, (unsigned)len, ttl, sid);
   }
   if (!gEspNow.tx(pkt, len)) {
-    safePrintf("[ESPN-TX] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
+    safePrintf("[ESPN-TXENQ] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
   }
 }
 #endif
@@ -827,12 +835,15 @@ static void setup_ble_server(){
 static void setup_espn(){
   uint8_t mac[6]; 
   WiFi.macAddress(mac);
+  safePrintf("[WIFI] MAC Address: %02X:%02X:%02X:%02X:%02X:%02X\r\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
   if (!gEspNow.init(NET_ID, mac, ESP_BH_CHANNEL, ESP_BH_LINK_MTU, ESP_BH_TX_CORE, ESP_BH_RX_CORE, ESP_BH_BALANCED_SPLIT)) {
     Serial.println("espn init FAIL");
     for(;;) delay(1000);
   }
   safePrintf("[ESPN] ESPNOW initialized on channel %u\r\n", ESP_BH_CHANNEL);
+
+  gEspNow.setDebugLevel(debugLevel);
 
   // BH RX worker
   xTaskCreatePinnedToCore(bhRxWorker, "bhrxw", 4096, nullptr, 3, nullptr, 0);
@@ -925,12 +936,18 @@ void loop(){
           break;
         case '+':
           if (debugLevel < 5) debugLevel++;
+#if ESP_BH
+          gEspNow.setDebugLevel(debugLevel);
+#endif
           Serial.printf("Debug level now %d\r\n", debugLevel);
           break;
         case '-':
           if (debugLevel > 0) debugLevel--;
+#if ESP_BH
+          gEspNow.setDebugLevel(debugLevel);
+#endif
           Serial.printf("Debug level now %d\r\n", debugLevel);
-          break;        
+          break;
       }
     }
     xSemaphoreGive(gSerialMutex);
