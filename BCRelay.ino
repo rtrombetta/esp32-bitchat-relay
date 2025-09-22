@@ -287,7 +287,8 @@ static void bhRxWorker(void*) {
     while (gEspNow.rxAvailable()) {
       uint8_t buf[espn::MAX_FRAME];
       size_t  n = sizeof(buf);
-      if (!gEspNow.rx(buf, &n, /*timeout_ms*/0)) break;
+      uint8_t srcMac[6];
+      if (!gEspNow.rxEx(buf, &n, srcMac, /*timeout_ms*/0)) break;
       if (n < MIN_PKT_LEN || buf[0] != 0x01) continue;
 
       // LOG de RX (antes do TTL--)
@@ -323,8 +324,8 @@ static void bhRxWorker(void*) {
       // 1) entrega aos centrals BLE
       relayToCentrals(buf, n, -1);
 
-      // 2) re-flood no backhaul (o log de TX sai em relayToBackhaul)
-      relayToBackhaul(buf, n);
+      // 2) re-flood no backhaul SEM eco + dedup BH (conteúdo e MAC+conteúdo)
+      relayToBackhaulExcept(buf, n, srcMac);
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
@@ -585,6 +586,36 @@ static inline void relayToBackhaul(const uint8_t* pkt, size_t len) {
   if (!gEspNow.tx(pkt, len)) {
     if (debugLevel >= 1) safePrintf("[ESPN-TXENQ] enqueue FAIL len=%u sid=%s\r\n", (unsigned)len, sid);
   }
+}
+
+// === Backhaul (ESPNOW) fan-out, exclui remetente + dedup BH (conteúdo e MAC+conteúdo)
+static inline void relayToBackhaulExcept(const uint8_t* pkt, size_t len, const uint8_t src_mac[6]) {
+  if (gEspNow.peerCount() == 0 || !pkt || len < MIN_PKT_LEN || pkt[0] != 0x01) return;
+
+  // Dedup BH: header (TTL zerado) + até 32B de payload
+  const size_t hdr = (len < 19) ? len : 19;
+  uint8_t hdrNoTTL[19]; memcpy(hdrNoTTL, pkt, hdr); if (hdr >= 3) hdrNoTTL[2] = 0;
+  const size_t extra = (len > hdr) ? ((len - hdr) < 32 ? (len - hdr) : 32) : 0;
+
+  const uint64_t hContent = fnv1a64(hdrNoTTL, hdr) ^ (extra ? fnv1a64(pkt + hdr, extra) : 0);
+  static std::deque<DedupEntry> dQ; static std::unordered_set<uint64_t> dS;
+  auto bhSeen = [&](uint64_t h)->bool{
+    uint64_t now = nowMs();
+    while(!dQ.empty() && (now - dQ.front().tms) > 15000){ dS.erase(dQ.front().h); dQ.pop_front(); }
+    if (dS.count(h)) return true; if (dQ.size()>=512){ dS.erase(dQ.front().h); dQ.pop_front(); }
+    dQ.push_back({h, now}); dS.insert(h); return false;
+  };
+  if (bhSeen(hContent)) return;
+
+  // Dedup BH: MAC + conteúdo
+  uint8_t mix[6 + 19 + 32] = {0};
+  memcpy(mix, src_mac, 6); memcpy(mix + 6, hdrNoTTL, hdr); if (extra) memcpy(mix + 6 + hdr, pkt + hdr, extra);
+  const uint64_t hMac = fnv1a64(mix, 6 + hdr + extra);
+  static std::deque<DedupEntry> dQM; static std::unordered_set<uint64_t> dSM;
+  if (bhSeen(hMac)) return;
+
+  // Enfileira no BH excluindo o remetente; o driver já não espera ACK dele
+  (void)gEspNow.txExcept(pkt, len, src_mac);
 }
 #endif
 

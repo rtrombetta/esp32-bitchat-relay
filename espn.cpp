@@ -10,6 +10,9 @@
 #endif
 #include <string.h>
 
+#define MACFMT "%02X:%02X:%02X:%02X:%02X:%02X"
+#define MACARGS(m) (m)[0],(m)[1],(m)[2],(m)[3],(m)[4],(m)[5]
+
 espn* espn::s_self = nullptr;
 
 static const uint8_t ESPN_BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -122,13 +125,29 @@ bool espn::tx(const uint8_t* frame, size_t len, uint32_t timeout_ms) {
   TxItem item{};
   item.len = (uint16_t)len;
   memcpy(item.buf, frame, len);
+  item.have_exclude = false;
   TickType_t to = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
   //if (m_debug >= 3) safeLog("[ESPN-TXENQ] len=%u\r\n", (unsigned)len);
   return xQueueSend(m_txQ, &item, to) == pdTRUE;
 }
 
+bool espn::txExcept(const uint8_t* frame, size_t len, const uint8_t exclude_mac[6], uint32_t timeout_ms) {
+  if (!m_txQ || !frame || len == 0 || len > MAX_FRAME || !exclude_mac) return false;
+  TxItem item{};
+  item.len = (uint16_t)len;
+  memcpy(item.buf, frame, len);
+  item.have_exclude = true;
+  memcpy(item.exclude, exclude_mac, 6);
+  TickType_t to = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
+  return xQueueSend(m_txQ, &item, to) == pdTRUE;
+}
+
 // Se houver frame completo, copia pra 'out' (até *inout_len) e retorna true
 bool espn::rx(uint8_t* out, size_t* inout_len, uint32_t timeout_ms) {
+  return rxEx(out, inout_len, nullptr, timeout_ms);
+}
+
+bool espn::rxEx(uint8_t* out, size_t* inout_len, uint8_t src_mac[6], uint32_t timeout_ms) {
   if (!m_rxQ || !out || !inout_len || *inout_len == 0) return false;
   RxItem item{};
   TickType_t to = (timeout_ms == 0) ? 0 : pdMS_TO_TICKS(timeout_ms);
@@ -137,6 +156,7 @@ bool espn::rx(uint8_t* out, size_t* inout_len, uint32_t timeout_ms) {
     if (n > *inout_len) n = *inout_len;
     memcpy(out, item.buf, n);
     *inout_len = n;
+    if (src_mac) memcpy(src_mac, item.mac, 6);
     //if (m_debug >= 3) safeLog("[ESPN-RXDEQ] len=%u\r\n", (unsigned)n);
     return true;
   }
@@ -219,8 +239,8 @@ void espn::txTask() {
   TxItem it{};
   for (;;) {
     if (xQueueReceive(m_txQ, &it, portMAX_DELAY) == pdTRUE) {
-      if (m_debug >= 4) safeLog("[ESPN-TXDEQ] len=%u\r\n", (unsigned)it.len);
-      llf_sendFrame(it.buf, it.len);
+      if (m_debug >= 4) safeLog("[ESPN-TXDEQ] len=%u excl=%d\r\n", (unsigned)it.len, (int)it.have_exclude);
+      llf_sendFrame(it.buf, it.len, it.have_exclude ? it.exclude : nullptr);
     }
   }
 }
@@ -236,8 +256,10 @@ void espn::rxTask() {
         r.len = (uint16_t)fullLen;
         if (r.len > MAX_FRAME) r.len = MAX_FRAME;
         memcpy(r.buf, full, r.len);
+        memcpy(r.mac, fr.mac, 6);
+        // não bloqueia no callback
         xQueueSend(m_rxQ, &r, 0);
-        if (m_debug >= 4) safeLog("[ESPN-RXENQ] len=%u\r\n", (unsigned)r.len);
+        if (m_debug >= 4) safeLog("[ESPN-RXENQ] len=%u mac=" MACFMT "\r\n", (unsigned)r.len, MACARGS(r.mac));
       }
     }
     llf_gc();
@@ -246,7 +268,7 @@ void espn::rxTask() {
 }
 
 // ---------- Envio (fragmentação + ARQ) ----------
-bool espn::llf_sendFrame(const uint8_t* frame, size_t flen) {
+bool espn::llf_sendFrame(const uint8_t* frame, size_t flen, const uint8_t* exclude_mac) {
   if (flen == 0 || flen > MAX_FRAME) return false;
 
   const size_t hdr = sizeof(LLF);
@@ -266,7 +288,23 @@ bool espn::llf_sendFrame(const uint8_t* frame, size_t flen) {
   const uint8_t gid = make_gid();
   m_ack_seen[gid]     = 0;
   m_ack_mask_got      = 0;
-  m_ack_mask_expect   = (m_nPeers > 0) ? (uint16_t)((1u << m_nPeers) - 1u) : 0;
+
+  // Esperar ACK só dos peers NÃO-excluídos
+  m_ack_mask_expect   = 0;
+  if (m_nPeers > 0) {
+    for (int p = 0; p < m_nPeers; ++p) {
+      if (exclude_mac && memcmp(m_peers[p].mac, exclude_mac, 6) == 0) {
+        if (m_debug >= 4) safeLog("[ESPN-SKIP] gid=%u excl " MACFMT "\r\n", gid, MACARGS(m_peers[p].mac));
+        continue;
+      }
+      m_ack_mask_expect |= (uint16_t)(1u << p);
+    }
+  }
+  // Se, após excluir, não restou ninguém pra enviar → sucesso “vazio”
+  if (m_ack_mask_expect == 0) {
+    m_ack_seen[gid] = 0;
+    return true;
+  }
 
   for (uint8_t attempt = 0; attempt <= (RELIABLE ? MAX_RETRIES : 0); ++attempt) {
     if (m_debug >= 4) safeLog("[ESPN-TX] gid=%u cnt=%u total=%u (attemp %u)\r\n",
@@ -278,8 +316,20 @@ bool espn::llf_sendFrame(const uint8_t* frame, size_t flen) {
       break;
     }
     for (int p = 0; p < m_nPeers; ++p) {
-      if ( (m_ack_mask_got & (1u << p)) != 0 ) continue; // já OK
-      if (!ensurePeer(m_peers[p].mac)) continue;
+      if (exclude_mac && memcmp(m_peers[p].mac, exclude_mac, 6) == 0) {
+        if (m_debug >= 4) safeLog("[ESPN-SKIP] gid=%u reason=exclude-peer " MACFMT "\r\n", gid, MACARGS(m_peers[p].mac));
+        continue;
+      }
+      if ( (m_ack_mask_got & (1u << p)) != 0 ) {
+        if (m_debug >= 4) safeLog("[ESPN-SKIP] gid=%u reason=already-acked " MACFMT "\r\n", gid, MACARGS(m_peers[p].mac));
+        continue; // já OK
+      }
+      if (!ensurePeer(m_peers[p].mac)) {
+        if (m_debug >= 4) safeLog("[ESPN-SKIP] gid=%u reason=peer-not-found " MACFMT "\r\n", gid, MACARGS(m_peers[p].mac));
+        continue;
+      }
+      if (m_debug >= 3) safeLog("[ESPN-SEND] gid=%u -> " MACFMT " frags=%u total=%u\r\n", gid, MACARGS(m_peers[p].mac), cnt, (uint16_t)flen);
+      // envia os frags na ordem 0..cnt-1
       size_t off = 0;
       for (uint8_t i = 0; i < cnt; ++i) {
         size_t part = m_balanced ? (base + (i < rem ? 1 : 0))
@@ -303,10 +353,12 @@ bool espn::llf_sendFrame(const uint8_t* frame, size_t flen) {
     while ((now_ms() - t0) < ACK_TIMEOUT_MS) {
       // sucesso quando TODOS os peers esperados ackaram
       if (m_nPeers > 0 && m_ack_mask_expect != 0 && (m_ack_mask_got == m_ack_mask_expect)) {
-        m_ack_seen[gid] = 0; return true;
+        m_ack_seen[gid] = 0; 
+        return true;
       }
       vTaskDelay(pdMS_TO_TICKS(1));
     }
+    if (m_debug >= 4) safeLog("[ESPN-TMO] gid=%u attempt %u timeout!\r\n", gid, (uint32_t)(attempt + 1));
     // timeout → tenta de novo
   }
   m_ack_seen[gid] = 0;

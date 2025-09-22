@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <esp_now.h>
+#include <string.h>
 
 // Declaração do semáforo global definido no .ino
 extern SemaphoreHandle_t gSerialMutex;
@@ -44,8 +45,14 @@ public:
   // Enfileira um frame completo para enviar no backbone (fragmenta dentro)
   bool tx(const uint8_t* frame, size_t len, uint32_t timeout_ms = 0);
 
+  // Enfileira excluindo um MAC (não envia pra ele nem espera ACK dele)
+  bool txExcept(const uint8_t* frame, size_t len, const uint8_t exclude_mac[6], uint32_t timeout_ms = 0);
+
   // Se houver frame completo, copia pra 'out' (até *inout_len) e retorna true
   bool rx(uint8_t* out, size_t* inout_len, uint32_t timeout_ms = 0);
+
+  // Variante que também retorna o MAC de origem do frame backbone.
+  bool rxEx(uint8_t* out, size_t* inout_len, uint8_t src_mac[6], uint32_t timeout_ms = 0);
 
   // Quantos frames completos aguardando leitura
   size_t rxAvailable() const;
@@ -89,8 +96,19 @@ private:
     uint8_t  net_id[NET_ID_LEN];  // filtro de rede
   };
 
-  struct TxItem { uint16_t len; uint8_t buf[MAX_FRAME]; };
-  struct RxItem { uint16_t len; uint8_t buf[MAX_FRAME]; };
+  struct TxItem {
+    uint16_t len;
+    uint8_t  buf[MAX_FRAME];
+    bool     have_exclude;
+    uint8_t  exclude[6];
+  };
+
+  struct RxItem {
+    uint16_t len;
+    uint8_t  buf[MAX_FRAME];
+    uint8_t  mac[6];
+  };
+
   struct FragItem { uint8_t len; uint8_t buf[MAX_LINK_MTU]; uint8_t mac[6]; };
 
   struct FragSlot {
@@ -141,7 +159,7 @@ private:
   void rxTask();
 
   // Fragmentação/Remontagem
-  bool llf_sendFrame(const uint8_t* frame, size_t flen);
+  bool llf_sendFrame(const uint8_t* frame, size_t flen, const uint8_t* exclude_mac = nullptr);
   bool llf_feed(const uint8_t* pkt, size_t len, const uint8_t** out, size_t* outlen,
                 const uint8_t src_mac[6]);
   void llf_gc();
