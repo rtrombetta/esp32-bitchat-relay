@@ -8,10 +8,10 @@ extern SemaphoreHandle_t gSerialMutex;
 
 // ================== Configs por #define (override no .ino se quiser) ==================
 #ifndef ESPN_ACK_TIMEOUT_MS
-#define ESPN_ACK_TIMEOUT_MS   100   // espera pelo ACK de aplicação (por gid)
+#define ESPN_ACK_TIMEOUT_MS   200   // espera pelo ACK de aplicação (por gid)
 #endif
 #ifndef ESPN_MAX_RETRIES
-#define ESPN_MAX_RETRIES       5   // tentativas de reenvio
+#define ESPN_MAX_RETRIES       4   // tentativas de reenvio
 #endif
 #ifndef ESPN_ANNOUNCE_IV_MS
 #define ESPN_ANNOUNCE_IV_MS 10000  // intervalo do broadcast ANNOUNCE (descoberta)

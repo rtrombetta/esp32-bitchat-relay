@@ -17,6 +17,8 @@
  */
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
 #include <map>
@@ -36,8 +38,8 @@
 #define BITCHAT_CHARACTERISTIC_UUID   "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D"
 
 // ===== Connection Limits =====
-#define MAX_PEERS                     8   // max connections
-#define BLE_POWER                     9   // dBm (0..9 typical)
+#define MAX_PEERS                     8   // max BLE connections
+#define BLE_POWER                     9   // BLE Power level dBm (0..9 typical)
 
 // ===== Types =====
 #define ANNOUNCE_TYPE                 0x01  // BitChat announce
@@ -949,14 +951,17 @@ void loop(){
     uint32_t centrals = gPeerMtus.size();
     uint32_t subs = 0; for (auto &kv: gSubscribed) if (kv.second) subs++;
 
-    Serial.println("==================================[STATUS]==================================");
-    Serial.printf("pktsIn: %u | bytesIn: %u | pktsOut: %u | bytesOut: %u | writes: %u | notifies: %u \r\nheap: %u | minCap: %u | q: %u | tokens: %u | dedupWin: %u | drops{dedup: %u, backp: %u} \r\ninflightB: %u | t1_in: %u | t2_in: %u | peers: %u | subs{notify: %u} \r\n%s \r\n",
+    Serial.println("===================================[STATUS]===================================");
+    Serial.printf("pktsIn: %u | bytesIn: %u | pktsOut: %u | bytesOut: %u | writes: %u | notifies: %u \r\n" \
+                  "heap: %u | minCap: %u | q: %u | tokens: %u | dedupWin: %u | drops{dedup: %u, backp: %u} \r\n" \
+                  "inflightB: %u | t1_in: %u | t2_in: %u | peers: %u | subs{notify: %u} \r\n" \
+                  "%s \r\n",
       gPktsIn, gBytesIn, gPktsOut, gBytesOut, gWrites, gNotifies,
       ESP.getFreeHeap(), (unsigned)cap, (unsigned)qsz, (unsigned)gNotifyTokens,
       (unsigned)gSeenDeque.size(), (unsigned)gDropsDedup, (unsigned)gDropsBackpressure,
-      (unsigned)gInflightBytes, gType1In, gType2In,
-      centrals, subs, mtuList.c_str());
-    Serial.println("============================================================================");
+      (unsigned)gInflightBytes, gType1In, gType2In, centrals, subs, 
+      mtuList.c_str());
+    Serial.println("==============================================================================");
   }
 
   // Comandos seriais
