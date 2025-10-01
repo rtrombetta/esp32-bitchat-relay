@@ -20,7 +20,7 @@ extern SemaphoreHandle_t gSerialMutex;
 #define ESPN_PEER_TTL_MS     90000 // expira peer se não ouvir ANNOUNCE nesse tempo
 #endif
 #ifndef ESPN_MAX_PEERS
-#define ESPN_MAX_PEERS         6   // máximo de peers (fan-out unicast)
+#define ESPN_MAX_PEERS         6   // max peers [1-16] fan-out unicast
 #endif
 
 // Backbone ESPNOW com filas TX/RX e fragmentação LLF balanceada.

@@ -19,6 +19,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <WiFi.h>
 #include <NimBLEDevice.h>
 #include <map>
